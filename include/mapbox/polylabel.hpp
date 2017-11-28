@@ -66,23 +66,46 @@ auto pointToPolygonDist(const geometry::point<T>& point, const geometry::polygon
 }
 
 template <class T>
+struct FitnessFunctor {
+    FitnessFunctor(geometry::point<T> centroid, geometry::point<T> polygonSize)
+        : centroid(centroid),
+          maxSize(std::max(polygonSize.x, polygonSize.y))
+        {}
+
+    T operator()(const geometry::point<T>& cellCenter, T distancePolygon) const {
+        if (distancePolygon <= 0) {
+            return distancePolygon;
+        }
+        geometry::point<T> d = cellCenter - centroid;
+        double distanceCentroid = std::sqrt(d.x * d.x + d.y * d.y);
+        return distancePolygon * (1 - distanceCentroid / maxSize);
+    }
+
+    geometry::point<T> centroid;
+    T maxSize;
+};
+
+template <class T>
 struct Cell {
-    Cell(const geometry::point<T>& c_, T h_, const geometry::polygon<T>& polygon)
+    template <class FitnessFunc>
+    Cell(const geometry::point<T>& c_, T h_, const geometry::polygon<T>& polygon, const FitnessFunc& ff)
         : c(c_),
           h(h_),
           d(pointToPolygonDist(c, polygon)),
-          max(d + h * std::sqrt(2))
+          fitness(ff(c, d)),
+          maxFitness(ff(c, d + h * std::sqrt(2)))
         {}
 
     geometry::point<T> c; // cell center
     T h; // half the cell size
     T d; // distance from cell center to polygon
-    T max; // max distance to polygon within a cell
+    T fitness; // fitness of the cell center
+    T maxFitness; // a "potential" of the cell calculated from max distance to polygon within the cell
 };
 
 // get polygon centroid
 template <class T>
-Cell<T> getCentroidCell(const geometry::polygon<T>& polygon) {
+geometry::point<T> getCentroid(const geometry::polygon<T>& polygon) {
     T area = 0;
     geometry::point<T> c { 0, 0 };
     const auto& ring = polygon.at(0);
@@ -96,7 +119,7 @@ Cell<T> getCentroidCell(const geometry::polygon<T>& polygon) {
         area += f * 3;
     }
 
-    return Cell<T>(area == 0 ? ring.at(0) : c / area, 0, polygon);
+    return area == 0 ? ring.at(0) : c / area;
 }
 
 } // namespace detail
@@ -118,7 +141,7 @@ geometry::point<T> polylabel(const geometry::polygon<T>& polygon, T precision = 
 
     // a priority queue of cells in order of their "potential" (max distance to polygon)
     auto compareMax = [] (const Cell<T>& a, const Cell<T>& b) {
-        return a.max < b.max;
+        return a.maxFitness < b.maxFitness;
     };
     using Queue = std::priority_queue<Cell<T>, std::vector<Cell<T>>, decltype(compareMax)>;
     Queue cellQueue(compareMax);
@@ -127,21 +150,18 @@ geometry::point<T> polylabel(const geometry::polygon<T>& polygon, T precision = 
         return envelope.min;
     }
 
+    geometry::point<T> centroid = getCentroid(polygon);
+    FitnessFunctor<T> fitnessFunc(centroid, size);
+
     // cover polygon with initial cells
     for (T x = envelope.min.x; x < envelope.max.x; x += cellSize) {
         for (T y = envelope.min.y; y < envelope.max.y; y += cellSize) {
-            cellQueue.push(Cell<T>({x + h, y + h}, h, polygon));
+            cellQueue.push(Cell<T>({x + h, y + h}, h, polygon, fitnessFunc));
         }
     }
 
     // take centroid as the first best guess
-    auto bestCell = getCentroidCell(polygon);
-
-    // special case for rectangular polygons
-    Cell<T> bboxCell(envelope.min + size / 2.0, 0, polygon);
-    if (bboxCell.d > bestCell.d) {
-        bestCell = bboxCell;
-    }
+    auto bestCell = Cell<T>(centroid, 0, polygon, fitnessFunc);
 
     auto numProbes = cellQueue.size();
     while (!cellQueue.empty()) {
@@ -150,20 +170,20 @@ geometry::point<T> polylabel(const geometry::polygon<T>& polygon, T precision = 
         cellQueue.pop();
 
         // update the best cell if we found a better one
-        if (cell.d > bestCell.d) {
+        if (cell.fitness > bestCell.fitness) {
             bestCell = cell;
             if (debug) std::cout << "found best " << ::round(1e4 * cell.d) / 1e4 << " after " << numProbes << " probes" << std::endl;
         }
 
         // do not drill down further if there's no chance of a better solution
-        if (cell.max - bestCell.d <= precision) continue;
+        if (cell.maxFitness - bestCell.fitness <= precision) continue;
 
         // split the cell into four cells
         h = cell.h / 2;
-        cellQueue.push(Cell<T>({cell.c.x - h, cell.c.y - h}, h, polygon));
-        cellQueue.push(Cell<T>({cell.c.x + h, cell.c.y - h}, h, polygon));
-        cellQueue.push(Cell<T>({cell.c.x - h, cell.c.y + h}, h, polygon));
-        cellQueue.push(Cell<T>({cell.c.x + h, cell.c.y + h}, h, polygon));
+        cellQueue.push(Cell<T>({cell.c.x - h, cell.c.y - h}, h, polygon, fitnessFunc));
+        cellQueue.push(Cell<T>({cell.c.x + h, cell.c.y - h}, h, polygon, fitnessFunc));
+        cellQueue.push(Cell<T>({cell.c.x - h, cell.c.y + h}, h, polygon, fitnessFunc));
+        cellQueue.push(Cell<T>({cell.c.x + h, cell.c.y + h}, h, polygon, fitnessFunc));
         numProbes += 4;
     }
 
